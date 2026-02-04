@@ -7,9 +7,9 @@ from tools.run_infinity import *
 from contextlib import contextmanager
 import gc
 
-model_path='/data2/guohang/pretrained/Infinity/infinity_2b_reg.pth'
-vae_path='/data2/guohang/pretrained/Infinity/infinity_vae_d32reg.pth'
-text_encoder_ckpt = '/data2/guohang/pretrained/flan-t5-xl'
+model_path='../Infinity/weights/infinity_2b_reg.pth'
+vae_path='../Infinity/weights/infinity_vae_d32reg.pth'
+text_encoder_ckpt = '../Infinity/weights/flan-t5-xl-official'
 args=argparse.Namespace(
     pn='1M', # 1M, 0.60M, 0.25M, 0.06M
     model_path=model_path,
@@ -44,10 +44,10 @@ infinity = load_transformer(vae, args)
 
 # 16GB memo
 prompt = \
-"""A cute cat on the grass."""
+"""A panoramic view of a skyscrapers in a big city, during sunset, with vibrant colors and dramatic lighting, ultra wide angle, high resolution, detailed architecture, cinematic composition."""
 cfg = 4
 tau = 0.5
-h_div_w = 1/1 # aspect ratio, height:width
+h_div_w = 1/2 # aspect ratio, height:width
 seed = random.randint(0, 10000)
 enable_positive_prompt=0
 
