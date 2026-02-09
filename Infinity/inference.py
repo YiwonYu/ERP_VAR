@@ -1,5 +1,6 @@
 import random
 import os
+import argparse
 import torch
 import cv2
 import numpy as np
@@ -7,33 +8,45 @@ from tools.run_infinity import *
 from contextlib import contextmanager
 import gc
 
-model_path='../Infinity/weights/infinity_2b_reg.pth'
-vae_path='../Infinity/weights/infinity_vae_d32reg.pth'
-text_encoder_ckpt = '../Infinity/weights/flan-t5-xl-official'
-args=argparse.Namespace(
-    pn='1M', # 1M, 0.60M, 0.25M, 0.06M
-    model_path=model_path,
-    cfg_insertion_layer=0,
-    vae_type=32,
-    vae_path=vae_path,
-    add_lvl_embeding_only_first_block=1,
-    use_bit_label=1,
-    model_type='infinity_2b',
-    rope2d_each_sa_layer=1,
-    rope2d_normalized_by_hw=2,
-    use_scale_schedule_embedding=0,
-    sampling_per_bits=1,
-    text_encoder_ckpt=text_encoder_ckpt,
-    text_channels=2048,
-    apply_spatial_patchify=0,
-    h_div_w_template=1.000,
-    use_flex_attn=0,
-    cache_dir='/dev/shm',
-    checkpoint_type='torch',
-    seed=0,
-    bf16=1,
-    save_file='tmp.jpg'
+model_path = "../Infinity/weights/infinity_2b_reg.pth"
+vae_path = "../Infinity/weights/infinity_vae_d32reg.pth"
+text_encoder_ckpt = "../Infinity/weights/flan-t5-xl-official"
+default_prompt = (
+    "A 360° equirectangular panorama (ERP), seamless left-right wrap, stable poles. "
+    "A high-altitude mountain valley at sunset, glowing clouds, distant snow peaks "
+    "forming a continuous horizon, river winding through pine forest, warm rim light, "
+    "natural colors, ultra detailed, photorealistic."
 )
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--pn", default="1M", help="1M, 0.60M, 0.25M, 0.06M")
+parser.add_argument("--model_path", default=model_path)
+parser.add_argument("--cfg_insertion_layer", type=int, default=0)
+parser.add_argument("--vae_type", type=int, default=32)
+parser.add_argument("--vae_path", default=vae_path)
+parser.add_argument("--add_lvl_embeding_only_first_block", type=int, default=1)
+parser.add_argument("--use_bit_label", type=int, default=1)
+parser.add_argument("--model_type", default="infinity_2b")
+parser.add_argument("--rope2d_each_sa_layer", type=int, default=1)
+parser.add_argument("--rope2d_normalized_by_hw", type=int, default=2)
+parser.add_argument("--use_scale_schedule_embedding", type=int, default=0)
+parser.add_argument("--sampling_per_bits", type=int, default=1)
+parser.add_argument("--text_encoder_ckpt", default=text_encoder_ckpt)
+parser.add_argument("--text_channels", type=int, default=2048)
+parser.add_argument("--apply_spatial_patchify", type=int, default=0)
+parser.add_argument("--h_div_w_template", type=float, default=1.000)
+parser.add_argument("--use_flex_attn", type=int, default=0)
+parser.add_argument("--cache_dir", default="/dev/shm")
+parser.add_argument("--checkpoint_type", default="torch")
+parser.add_argument("--seed", type=int, default=-1)
+parser.add_argument("--bf16", type=int, default=1)
+parser.add_argument("--save_file", default="tmp.jpg")
+parser.add_argument("--prompt", default=default_prompt)
+parser.add_argument("--cfg", type=float, default=4)
+parser.add_argument("--tau", type=float, default=0.5)
+parser.add_argument("--h_div_w", type=float, default=0.5)
+parser.add_argument("--enable_positive_prompt", type=int, default=0)
+args = parser.parse_args()
 
 # load text encoder
 text_tokenizer, text_encoder = load_tokenizer(t5_path=args.text_encoder_ckpt)
@@ -43,13 +56,12 @@ vae = load_visual_tokenizer(args)
 infinity = load_transformer(vae, args)
 
 # 16GB memo
-prompt = \
-"""A panoramic view of a skyscrapers in a big city, during sunset, with vibrant colors and dramatic lighting, ultra wide angle, high resolution, detailed architecture, cinematic composition."""
-cfg = 4
-tau = 0.5
-h_div_w = 1/2 # aspect ratio, height:width
-seed = random.randint(0, 10000)
-enable_positive_prompt=0
+prompt = args.prompt
+cfg = args.cfg
+tau = args.tau
+h_div_w = args.h_div_w  # aspect ratio, height:width
+seed = args.seed if args.seed >= 0 else random.randint(0, 10000)
+enable_positive_prompt = args.enable_positive_prompt
 
 h_div_w_template_ = h_div_w_templates[np.argmin(np.abs(h_div_w_templates-h_div_w))]
 scale_schedule = dynamic_resolution_h_w[h_div_w_template_][args.pn]['scales']
@@ -94,11 +106,10 @@ with torch.inference_mode():
             )
 
 
-args.save_file = 'ipynb_tmp.jpg'
-os.makedirs(osp.dirname(osp.abspath(args.save_file)), exist_ok=True)
+save_dir = osp.dirname(osp.abspath(args.save_file))
+os.makedirs(save_dir, exist_ok=True)
 cv2.imwrite(args.save_file, generated_image.cpu().numpy())
 print(f'Save to {osp.abspath(args.save_file)}')
-
 
 
 

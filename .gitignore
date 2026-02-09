@@ -150,6 +150,13 @@ dmypy.json
 # Pyre type checker
 .pyre/
 
+# jpg, png, gif thumbnails
+*.thumbnails/
+*.jpg
+*.png
+*.gif
+
+
 # pytype static type analyzer
 .pytype/
 
