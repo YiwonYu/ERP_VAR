@@ -1,0 +1,57 @@
+# FastVAR Panorama Configuration - ERP Mode
+# Equirectangular Panorama (360° seamless) training and inference
+
+# Mode selection
+mode: erp
+
+# FastVAR extensions
+use_fastvar: true
+use_border_keep: true
+border_keep_w: 2  # border width in tokens to always keep
+seam_boost: 1.5   # boost factor for border token importance
+
+# Shared border (cubemap only, ignored in ERP mode)
+use_shared_border_latent: false
+shared_border_mode: avg
+shared_border_width_tokens: 2
+
+# 3D direction embedding
+use_dir3d_embed: true
+dir3d_embed_dim: 64  # intermediate MLP dimension
+
+# Spherical attention bias
+use_spherical_attn_bias: true
+spherical_bias_lambda: 1.0   # bias strength (higher = more localized attention)
+spherical_bias_tau_deg: null  # optional temperature in degrees
+spherical_attn_fallback: standard  # "standard" or "sparse_neighbor"
+
+# Seam losses
+use_seam_losses: true
+wrap_seam_weight: 1.0         # weight for left-right wrap seam consistency
+pole_consistency_weight: 1.0  # weight for pole region smoothness
+pole_band_deg: 20.0           # degrees from pole to apply consistency loss
+pole_tau_deg: 10.0            # temperature for pole loss weighting
+pole_sigma_deg: 10.0          # sigma for neighbor weighting
+texture_step_boost: 1.0       # multiplier for late (texture) scales
+structure_step_weight: 0.1    # multiplier for early (structure) scales
+
+# ERP-specific settings
+erp_height: 512
+erp_width: 1024   # typically 2x height for 2:1 aspect ratio
+
+# Resolution preset
+pn: "1M"  # "0.06M", "0.25M", "0.60M", "1M"
+
+# Generation settings
+cfg: 4.0
+tau: 0.5
+seed: -1  # -1 for random
+
+# Prompt enhancement
+enable_positive_prompt: false
+
+# Example prompt for ERP panoramas
+# prompt: "A 360° equirectangular panorama (ERP), seamless left-right wrap, stable poles. 
+#          A high-altitude mountain valley at sunset, glowing clouds, distant snow peaks 
+#          forming a continuous horizon, river winding through pine forest, warm rim light, 
+#          natural colors, ultra detailed, photorealistic."
