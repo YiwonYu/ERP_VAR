@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-Panorama inference entrypoint for FastVAR.
+Panorama inference entrypoint for FastVAR with Infinity backend.
 
 Generates seamless 360° ERP panoramas or cubemap 6-face outputs.
 """
 
 import argparse
-import json
+import gc
 import logging
 import os
 import sys
@@ -14,15 +14,18 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+import cv2
+import numpy as np
 import torch
-import torch.nn as nn
+import torch.nn.functional as F
 from PIL import Image
-from torchvision import transforms
+from torch.cuda.amp import autocast
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
+sys.path.insert(0, str(Path(__file__).parent.parent / "Infinity"))
 
 from pano.config.pano_config import PanoConfig
-from pano.models.dir3d_embed import Direction3DEmbedding, compute_erp_directions, compute_cubemap_face_directions
+from pano.models.dir3d_embed import Direction3DEmbedding
 from pano.models.spherical_attention import SphericalAttentionBias
 from pano.fastvar.border_keep import compute_merge_with_border_keep
 from pano.fastvar.shared_border import synchronize_cubemap_borders
@@ -34,36 +37,59 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+H_DIV_W_ERP = 0.5
+
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Generate panorama images with FastVAR")
+    parser = argparse.ArgumentParser(description="Generate panorama images with FastVAR + Infinity")
     
     parser.add_argument("--config", type=str, default=None, help="Path to YAML/JSON config file")
-    parser.add_argument("--checkpoint", type=str, required=True, help="Path to model checkpoint")
     parser.add_argument("--mode", type=str, default="erp", choices=["erp", "cubemap"])
     parser.add_argument("--prompt", type=str, default=None, help="Text prompt for generation")
     parser.add_argument("--prompts_file", type=str, default=None, help="File with prompts (one per line)")
     parser.add_argument("--output_dir", type=str, default="./outputs/pano_infer", help="Output directory")
-    parser.add_argument("--height", type=int, default=512, help="Output height (ERP: width=2*height)")
     parser.add_argument("--num_samples", type=int, default=1, help="Samples per prompt")
     parser.add_argument("--seed", type=int, default=None, help="Random seed")
-    parser.add_argument("--cfg_scale", type=float, default=7.5, help="Classifier-free guidance scale")
+    
+    parser.add_argument("--pn", type=str, default="1M", choices=["0.06M", "0.25M", "0.60M", "1M"])
+    parser.add_argument("--model_path", type=str, required=True, help="Path to Infinity model weights")
+    parser.add_argument("--vae_path", type=str, required=True, help="Path to VAE weights")
+    parser.add_argument("--text_encoder_ckpt", type=str, required=True, help="Path to T5 text encoder")
+    parser.add_argument("--model_type", type=str, default="infinity_2b")
+    parser.add_argument("--vae_type", type=int, default=32)
+    
+    parser.add_argument("--cfg", type=float, default=4.0, help="Classifier-free guidance scale")
+    parser.add_argument("--tau", type=float, default=0.5, help="Temperature for sampling")
+    parser.add_argument("--cfg_insertion_layer", type=int, default=0)
+    parser.add_argument("--sampling_per_bits", type=int, default=1)
+    parser.add_argument("--enable_positive_prompt", type=int, default=0)
+    
+    parser.add_argument("--rope2d_each_sa_layer", type=int, default=1)
+    parser.add_argument("--rope2d_normalized_by_hw", type=int, default=2)
+    parser.add_argument("--use_scale_schedule_embedding", type=int, default=0)
+    parser.add_argument("--add_lvl_embeding_only_first_block", type=int, default=1)
+    parser.add_argument("--use_bit_label", type=int, default=1)
+    parser.add_argument("--text_channels", type=int, default=2048)
+    parser.add_argument("--apply_spatial_patchify", type=int, default=0)
+    parser.add_argument("--use_flex_attn", type=int, default=0)
+    parser.add_argument("--bf16", type=int, default=1)
+    parser.add_argument("--cache_dir", type=str, default="/dev/shm")
+    parser.add_argument("--checkpoint_type", type=str, default="torch")
+    
     parser.add_argument("--use_fastvar", action="store_true", default=True)
     parser.add_argument("--no_fastvar", action="store_true", help="Disable FastVAR acceleration")
-    
     parser.add_argument("--spherical_bias_lambda", type=float, default=1.0)
     parser.add_argument("--border_keep_w", type=int, default=2)
     parser.add_argument("--seam_boost", type=float, default=1.5)
     parser.add_argument("--shared_border_mode", type=str, default="avg", choices=["avg", "copy_owner"])
     
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--save_cubemap_combined", action="store_true", help="Save cubemap as single cross-layout image")
+    parser.add_argument("--save_cubemap_combined", action="store_true")
     
     return parser.parse_args()
 
 
 def load_config(config_path: Optional[str], args: argparse.Namespace) -> PanoConfig:
-    """Load config from file or create default, then merge CLI args."""
     if config_path:
         path = Path(config_path)
         if path.suffix in [".yaml", ".yml"]:
@@ -76,19 +102,15 @@ def load_config(config_path: Optional[str], args: argparse.Namespace) -> PanoCon
         config = PanoConfig(mode=args.mode)
     
     config.mode = args.mode
+    config.pn = args.pn
+    config.cfg = args.cfg
+    config.tau = args.tau
     config.spherical_bias_lambda = args.spherical_bias_lambda
     config.use_fastvar = not args.no_fastvar
     config.border_keep_w = args.border_keep_w
     config.seam_boost = args.seam_boost
     config.shared_border_mode = args.shared_border_mode
     
-    if args.mode == "erp":
-        config.erp_height = args.height
-        config.erp_width = args.height * 2
-    else:
-        config.cubemap_face_size = args.height
-    
-    config.cfg = args.cfg_scale
     if args.seed is not None:
         config.seed = args.seed
     
@@ -96,121 +118,174 @@ def load_config(config_path: Optional[str], args: argparse.Namespace) -> PanoCon
     return config
 
 
-class DummyGenerator(nn.Module):
-    """
-    Placeholder generator for demonstration.
-    Replace with actual Infinity/HART model loading.
-    """
+class InfinityPanoGenerator:
     
-    def __init__(self, hidden_dim: int = 768):
-        super().__init__()
-        self.hidden_dim = hidden_dim
-        self.net = nn.Sequential(
-            nn.Conv2d(3, hidden_dim // 4, 3, 1, 1),
-            nn.ReLU(),
-            nn.Conv2d(hidden_dim // 4, hidden_dim // 2, 3, 1, 1),
-            nn.ReLU(),
-            nn.Conv2d(hidden_dim // 2, hidden_dim // 4, 3, 1, 1),
-            nn.ReLU(),
-            nn.Conv2d(hidden_dim // 4, 3, 3, 1, 1),
-            nn.Tanh(),
+    def __init__(self, args: argparse.Namespace, config: PanoConfig, device: str = "cuda"):
+        self.args = args
+        self.config = config
+        self.device = device
+        
+        self._load_models()
+        
+        if config.use_spherical_attn_bias:
+            self.spherical_bias = SphericalAttentionBias(
+                lambda_=config.spherical_bias_lambda,
+                tau_deg=config.spherical_bias_tau_deg,
+            )
+        else:
+            self.spherical_bias = None
+    
+    def _load_models(self) -> None:
+        from tools.run_infinity import (
+            load_tokenizer, load_visual_tokenizer, load_transformer,
+            dynamic_resolution_h_w, h_div_w_templates
+        )
+        
+        logger.info("Loading text encoder...")
+        self.text_tokenizer, self.text_encoder = load_tokenizer(
+            t5_path=self.args.text_encoder_ckpt
+        )
+        
+        logger.info("Loading VAE...")
+        self.vae = load_visual_tokenizer(self.args)
+        
+        logger.info("Loading Infinity transformer...")
+        self.infinity = load_transformer(self.vae, self.args)
+        
+        self.dynamic_resolution_h_w = dynamic_resolution_h_w
+        self.h_div_w_templates = h_div_w_templates
+        
+        logger.info("All models loaded successfully")
+    
+    def _get_scale_schedule(self, h_div_w: float) -> list:
+        h_div_w_template = self.h_div_w_templates[
+            np.argmin(np.abs(self.h_div_w_templates - h_div_w))
+        ]
+        scale_schedule = self.dynamic_resolution_h_w[h_div_w_template][self.args.pn]['scales']
+        scale_schedule = [(1, h, w) for (_, h, w) in scale_schedule]
+        return scale_schedule
+    
+    def _encode_prompt(self, prompt: str) -> tuple:
+        from tools.run_infinity import encode_prompt
+        return encode_prompt(
+            self.text_tokenizer, 
+            self.text_encoder, 
+            prompt,
+            enable_positive_prompt=self.args.enable_positive_prompt
         )
     
-    def forward(self, noise: torch.Tensor) -> torch.Tensor:
-        return self.net(noise)
-
-
-def load_pano_model(
-    checkpoint_path: str,
-    config: PanoConfig,
-    device: str,
-) -> nn.Module:
-    """Load model with panorama-specific components."""
-    model = DummyGenerator()
+    def generate_erp(self, prompt: str, seed: Optional[int] = None) -> torch.Tensor:
+        from tools.run_infinity import gen_one_img
+        
+        scale_schedule = self._get_scale_schedule(H_DIV_W_ERP)
+        
+        g_seed = seed if seed is not None else (
+            self.config.seed if self.config.seed >= 0 else int(time.time()) % 10000
+        )
+        
+        with torch.inference_mode():
+            with autocast(dtype=torch.bfloat16):
+                generated_image = gen_one_img(
+                    self.infinity,
+                    self.vae,
+                    self.text_tokenizer,
+                    self.text_encoder,
+                    prompt,
+                    g_seed=g_seed,
+                    gt_leak=0,
+                    gt_ls_Bl=None,
+                    cfg_list=self.config.cfg,
+                    tau_list=self.config.tau,
+                    scale_schedule=scale_schedule,
+                    cfg_insertion_layer=[self.args.cfg_insertion_layer],
+                    vae_type=self.args.vae_type,
+                    sampling_per_bits=self.args.sampling_per_bits,
+                    enable_positive_prompt=self.args.enable_positive_prompt,
+                )
+        
+        return generated_image
     
-    if Path(checkpoint_path).exists():
-        try:
-            checkpoint = torch.load(checkpoint_path, map_location=device)
-            if "model_state_dict" in checkpoint:
-                model.load_state_dict(checkpoint["model_state_dict"], strict=False)
-            else:
-                model.load_state_dict(checkpoint, strict=False)
-            logger.info(f"Loaded checkpoint from {checkpoint_path}")
-        except Exception as e:
-            logger.warning(f"Could not load checkpoint: {e}. Using random weights.")
-    else:
-        logger.warning(f"Checkpoint not found: {checkpoint_path}. Using random weights.")
-    
-    return model.to(device).eval()
-
-
-def generate_erp(
-    model: nn.Module,
-    prompt: str,
-    height: int,
-    cfg_scale: float,
-    seed: Optional[int],
-    config: PanoConfig,
-    device: str,
-) -> torch.Tensor:
-    """Generate a single ERP panorama."""
-    width = height * 2
-    
-    if seed is not None:
-        torch.manual_seed(seed)
-    
-    noise = torch.randn(1, 3, height, width, device=device)
-    
-    with torch.inference_mode():
-        output = model(noise)
-    
-    output = (output + 1) / 2
-    output = output.clamp(0, 1)
-    
-    return output[0]
-
-
-def generate_cubemap(
-    model: nn.Module,
-    prompt: str,
-    face_size: int,
-    cfg_scale: float,
-    seed: Optional[int],
-    config: PanoConfig,
-    device: str,
-) -> torch.Tensor:
-    """Generate 6-face cubemap."""
-    if seed is not None:
-        torch.manual_seed(seed)
-    
-    noise = torch.randn(6, 3, face_size, face_size, device=device)
-    
-    with torch.inference_mode():
+    def generate_cubemap(self, prompt: str, seed: Optional[int] = None) -> torch.Tensor:
+        from tools.run_infinity import gen_one_img
+        
+        scale_schedule = self._get_scale_schedule(1.0)
+        
+        g_seed = seed if seed is not None else (
+            self.config.seed if self.config.seed >= 0 else int(time.time()) % 10000
+        )
+        
         faces = []
-        for i in range(6):
-            face_output = model(noise[i:i+1])
-            faces.append(face_output)
-        output = torch.cat(faces, dim=0)
-    
-    if config.use_shared_border_latent:
-        output = output.unsqueeze(0)
-        output = synchronize_cubemap_borders(
-            output,
-            mode=config.shared_border_mode,
-            border_width=config.shared_border_width_tokens,
-        )
-        output = output.squeeze(0)
-    
-    output = (output + 1) / 2
-    output = output.clamp(0, 1)
-    
-    return output
+        face_prompts = [
+            f"{prompt}, front view",
+            f"{prompt}, right side view",
+            f"{prompt}, back view",
+            f"{prompt}, left side view",
+            f"{prompt}, looking up at the sky",
+            f"{prompt}, looking down at the ground",
+        ]
+        
+        with torch.inference_mode():
+            with autocast(dtype=torch.bfloat16):
+                for i, face_prompt in enumerate(face_prompts):
+                    face_seed = g_seed + i * 1000
+                    face_image = gen_one_img(
+                        self.infinity,
+                        self.vae,
+                        self.text_tokenizer,
+                        self.text_encoder,
+                        face_prompt,
+                        g_seed=face_seed,
+                        gt_leak=0,
+                        gt_ls_Bl=None,
+                        cfg_list=self.config.cfg,
+                        tau_list=self.config.tau,
+                        scale_schedule=scale_schedule,
+                        cfg_insertion_layer=[self.args.cfg_insertion_layer],
+                        vae_type=self.args.vae_type,
+                        sampling_per_bits=self.args.sampling_per_bits,
+                        enable_positive_prompt=self.args.enable_positive_prompt,
+                    )
+                    faces.append(face_image)
+        
+        faces_tensor = torch.stack([
+            torch.from_numpy(f.cpu().numpy() if isinstance(f, torch.Tensor) else f).float() 
+            for f in faces
+        ])
+        
+        if faces_tensor.max() > 1.0:
+            faces_tensor = faces_tensor / 255.0
+        
+        if self.config.use_shared_border_latent:
+            faces_tensor = faces_tensor.unsqueeze(0).to(self.device)
+            faces_tensor = synchronize_cubemap_borders(
+                faces_tensor,
+                mode=self.config.shared_border_mode,
+                border_width=self.config.shared_border_width_tokens,
+            )
+            faces_tensor = faces_tensor.squeeze(0)
+        
+        return faces_tensor
 
 
 def save_erp_image(image: torch.Tensor, output_path: Path) -> None:
-    """Save ERP image to file."""
-    img_np = (image.permute(1, 2, 0).cpu().numpy() * 255).astype("uint8")
-    Image.fromarray(img_np).save(output_path)
+    if isinstance(image, np.ndarray):
+        img_np = image
+    else:
+        img_np = image.cpu().numpy()
+    
+    if img_np.dtype != np.uint8:
+        if img_np.max() <= 1.0:
+            img_np = (img_np * 255).astype(np.uint8)
+        else:
+            img_np = img_np.astype(np.uint8)
+    
+    if img_np.shape[0] == 3:
+        img_np = np.transpose(img_np, (1, 2, 0))
+    
+    if img_np.shape[-1] == 3:
+        img_np = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
+    
+    cv2.imwrite(str(output_path), img_np)
 
 
 def save_cubemap_images(
@@ -219,26 +294,56 @@ def save_cubemap_images(
     prefix: str,
     save_combined: bool = False,
 ) -> None:
-    """Save cubemap faces as separate images or combined."""
     face_names = ["front", "right", "back", "left", "top", "bottom"]
     
     for i, name in enumerate(face_names):
-        img_np = (faces[i].permute(1, 2, 0).cpu().numpy() * 255).astype("uint8")
+        face = faces[i]
+        if isinstance(face, torch.Tensor):
+            img_np = face.cpu().numpy()
+        else:
+            img_np = face
+        
+        if img_np.dtype != np.uint8:
+            if img_np.max() <= 1.0:
+                img_np = (img_np * 255).astype(np.uint8)
+            else:
+                img_np = img_np.astype(np.uint8)
+        
+        if img_np.shape[0] == 3:
+            img_np = np.transpose(img_np, (1, 2, 0))
+        
         Image.fromarray(img_np).save(output_dir / f"{prefix}_{name}.png")
     
     if save_combined:
-        _, H, W = faces.shape[1:]
-        cross = torch.zeros(3, H * 3, W * 4, device=faces.device)
+        face_0 = faces[0]
+        if isinstance(face_0, torch.Tensor):
+            face_h, face_w = int(face_0.shape[-2]), int(face_0.shape[-1])
+        else:
+            face_h, face_w = int(face_0.shape[0]), int(face_0.shape[1])
         
-        cross[:, 0:H, W:2*W] = faces[4]
-        cross[:, H:2*H, 0:W] = faces[3]
-        cross[:, H:2*H, W:2*W] = faces[0]
-        cross[:, H:2*H, 2*W:3*W] = faces[1]
-        cross[:, H:2*H, 3*W:4*W] = faces[2]
-        cross[:, 2*H:3*H, W:2*W] = faces[5]
+        cross = np.zeros((face_h * 3, face_w * 4, 3), dtype=np.uint8)
         
-        img_np = (cross.permute(1, 2, 0).cpu().numpy() * 255).astype("uint8")
-        Image.fromarray(img_np).save(output_dir / f"{prefix}_cross.png")
+        for i, (row, col) in enumerate([(0, 1), (1, 2), (2, 1), (1, 0), (1, 1), (1, 3)]):
+            face = faces[i]
+            if isinstance(face, torch.Tensor):
+                img_np = face.cpu().numpy()
+            else:
+                img_np = face
+            
+            if img_np.dtype != np.uint8:
+                if img_np.max() <= 1.0:
+                    img_np = (img_np * 255).astype(np.uint8)
+                else:
+                    img_np = img_np.astype(np.uint8)
+            
+            if img_np.shape[0] == 3:
+                img_np = np.transpose(img_np, (1, 2, 0))
+            
+            y_start, y_end = row * face_h, (row + 1) * face_h
+            x_start, x_end = col * face_w, (col + 1) * face_w
+            cross[y_start:y_end, x_start:x_end] = img_np
+        
+        Image.fromarray(cross).save(output_dir / f"{prefix}_cross.png")
 
 
 def main() -> None:
@@ -250,7 +355,7 @@ def main() -> None:
     config = load_config(args.config, args)
     logger.info(f"Config:\n{config}")
     
-    model = load_pano_model(args.checkpoint, config, args.device)
+    generator = InfinityPanoGenerator(args, config, args.device)
     
     prompts: List[str] = []
     if args.prompt:
@@ -260,16 +365,23 @@ def main() -> None:
             prompts.extend([line.strip() for line in f if line.strip()])
     
     if not prompts:
-        prompts = ["A beautiful 360 panorama landscape"]
-        logger.info("No prompt provided, using default")
+        prompts = [
+            "A 360° equirectangular panorama (ERP), seamless left-right wrap, stable poles. "
+            "A high-altitude mountain valley at sunset, glowing clouds, distant snow peaks "
+            "forming a continuous horizon, river winding through pine forest, warm rim light, "
+            "natural colors, ultra detailed, photorealistic."
+        ]
+        logger.info("No prompt provided, using default panorama prompt")
     
     logger.info(f"Generating {len(prompts)} prompt(s) x {args.num_samples} sample(s)")
     
     total_time = 0.0
     total_images = 0
     
+    torch.cuda.reset_peak_memory_stats() if torch.cuda.is_available() else None
+    
     for prompt_idx, prompt in enumerate(prompts):
-        logger.info(f"[{prompt_idx + 1}/{len(prompts)}] Prompt: {prompt[:50]}...")
+        logger.info(f"[{prompt_idx + 1}/{len(prompts)}] Prompt: {prompt[:80]}...")
         
         for sample_idx in range(args.num_samples):
             seed = args.seed + sample_idx if args.seed is not None else None
@@ -277,17 +389,11 @@ def main() -> None:
             start_time = time.time()
             
             if config.mode == "erp":
-                image = generate_erp(
-                    model, prompt, config.erp_height,
-                    config.cfg, seed, config, args.device
-                )
+                image = generator.generate_erp(prompt, seed)
                 output_path = output_dir / f"erp_{prompt_idx:04d}_{sample_idx:04d}.png"
                 save_erp_image(image, output_path)
             else:
-                faces = generate_cubemap(
-                    model, prompt, config.cubemap_face_size,
-                    config.cfg, seed, config, args.device
-                )
+                faces = generator.generate_cubemap(prompt, seed)
                 prefix = f"cubemap_{prompt_idx:04d}_{sample_idx:04d}"
                 save_cubemap_images(faces, output_dir, prefix, args.save_cubemap_combined)
                 output_path = output_dir / f"{prefix}_front.png"
@@ -297,6 +403,9 @@ def main() -> None:
             total_images += 1
             
             logger.info(f"  Sample {sample_idx + 1}: {gen_time:.2f}s -> {output_path}")
+            
+            gc.collect()
+            torch.cuda.empty_cache() if torch.cuda.is_available() else None
     
     if torch.cuda.is_available():
         peak_memory = torch.cuda.max_memory_allocated() / 1024**3

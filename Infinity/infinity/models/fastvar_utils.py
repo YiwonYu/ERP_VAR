@@ -39,6 +39,10 @@ def masked_previous_scale_cache(cur_x, num_remain, cur_shape):
 # 2/1:  (1, 46, 23), (1, 60, 30), (1, 74, 37), (1, 90, 45) (1,120,60)
 # 1/1 , (13, 32, 32), (15, 40, 40), (17, 48, 48), (21, 64, 64), (1, 84, 84)]
 def compute_merge(x: torch.Tensor, prune_scale_list=[32, 40], is_later_layer=False, x_shape=None) -> Tuple[Callable, ...]:
+    # During training, x_shape may be None - disable pruning in that case
+    if x_shape is None:
+        return (do_nothing, do_nothing, do_nothing)
+    
     _, original_h, original_w = x_shape
     original_tokens = original_h * original_w
 

@@ -241,3 +241,120 @@ def create_erp_dataloader(
         pin_memory=True,
         drop_last=False,
     )
+
+
+class HFPanoramaDataset(Dataset[Dict[str, Any]]):
+    """
+    Wrapper for HuggingFace datasets in parquet format (e.g., Matterport3D_polished).
+    
+    Expects dataset with 'image' (PIL Image) and 'caption' (string) columns.
+    """
+    
+    def __init__(
+        self,
+        dataset_path: str,
+        split: str = "train",
+        transform: Optional[Callable[..., Any]] = None,
+        target_height: int = 512,
+    ):
+        try:
+            from datasets import load_dataset
+        except ImportError:
+            raise ImportError("HuggingFace datasets library required: pip install datasets")
+        
+        self.dataset = load_dataset(dataset_path, split=split)
+        self.transform = transform
+        self.target_height = target_height
+        self.target_width = target_height * 2
+        
+        if self.transform is None:
+            self.transform = transforms.Compose([
+                transforms.Resize(
+                    (self.target_height, self.target_width), 
+                    interpolation=InterpolationMode.BILINEAR
+                ),
+                transforms.ToTensor(),
+            ])
+    
+    def __len__(self) -> int:
+        return len(self.dataset)
+    
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        item = self.dataset[idx]
+        
+        img = item["image"]
+        if not isinstance(img, Image.Image):
+            img = Image.open(img).convert("RGB")
+        else:
+            img = img.convert("RGB")
+        
+        original_size = img.size
+        
+        if self.transform is not None:
+            img = self.transform(img)
+        
+        caption = item.get("caption", "A 360 degree panoramic image")
+        if not caption:
+            caption = "A 360 degree panoramic image"
+        
+        return {
+            "image": img,
+            "prompt": caption,
+            "original_size": original_size,
+        }
+
+
+def create_hf_pano_dataloader(
+    dataset_path: str,
+    batch_size: int,
+    target_height: int = 512,
+    num_workers: int = 4,
+    shuffle: bool = True,
+    distributed: bool = False,
+    world_size: int = 1,
+    rank: int = 0,
+) -> Tuple[DataLoader[Dict[str, Any]], Optional[Any]]:
+    """
+    Create DataLoader for HuggingFace panorama dataset with optional DDP support.
+    
+    Returns:
+        Tuple of (dataloader, sampler) - sampler is None if not distributed
+    """
+    from torch.utils.data.distributed import DistributedSampler
+    
+    transform = transforms.Compose([
+        transforms.Resize(
+            (target_height, target_height * 2), 
+            interpolation=InterpolationMode.BILINEAR
+        ),
+        transforms.ToTensor(),
+    ])
+    
+    dataset = HFPanoramaDataset(
+        dataset_path=dataset_path,
+        split="train",
+        transform=transform,
+        target_height=target_height,
+    )
+    
+    sampler = None
+    if distributed:
+        sampler = DistributedSampler(
+            dataset,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=shuffle,
+        )
+        shuffle = False
+    
+    dataloader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle if not distributed else False,
+        num_workers=num_workers,
+        pin_memory=True,
+        drop_last=True,
+        sampler=sampler,
+    )
+    
+    return dataloader, sampler
