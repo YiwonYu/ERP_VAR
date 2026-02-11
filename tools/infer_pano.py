@@ -12,7 +12,7 @@ import os
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 import cv2
 import numpy as np
@@ -25,11 +25,10 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 sys.path.insert(0, str(Path(__file__).parent.parent / "Infinity"))
 
 from pano.config.pano_config import PanoConfig
-from pano.models.dir3d_embed import Direction3DEmbedding
 from pano.models.spherical_attention import SphericalAttentionBias
-from pano.fastvar.border_keep import compute_merge_with_border_keep
-from pano.fastvar.shared_border import synchronize_cubemap_borders
-from pano.geometry.cubemap import cubemap_to_erp
+
+# Note: Cubemap mode is experimental and not the primary use case.
+# ERP (equirectangular) mode is the default and fully supported.
 
 logging.basicConfig(
     level=logging.INFO,
@@ -53,6 +52,8 @@ def parse_args() -> argparse.Namespace:
     
     parser.add_argument("--pn", type=str, default="1M", choices=["0.06M", "0.25M", "0.60M", "1M"])
     parser.add_argument("--model_path", type=str, required=True, help="Path to Infinity model weights")
+    parser.add_argument("--checkpoint", type=str, default=None, 
+                        help="Path to trained checkpoint (e.g., outputs/pano_matterport3d/checkpoint_latest.pt)")
     parser.add_argument("--vae_path", type=str, required=True, help="Path to VAE weights")
     parser.add_argument("--text_encoder_ckpt", type=str, required=True, help="Path to T5 text encoder")
     parser.add_argument("--model_type", type=str, default="infinity_2b")
@@ -151,6 +152,28 @@ class InfinityPanoGenerator:
         
         logger.info("Loading Infinity transformer...")
         self.infinity = load_transformer(self.vae, self.args)
+        
+        # Load trained checkpoint if provided
+        if self.args.checkpoint:
+            logger.info(f"Loading trained checkpoint from {self.args.checkpoint}")
+            checkpoint = torch.load(self.args.checkpoint, map_location=self.device)
+            
+            # Extract model state dict
+            if "infinity_state_dict" in checkpoint:
+                state_dict = checkpoint["infinity_state_dict"]
+                epoch = checkpoint.get("epoch", "unknown")
+                logger.info(f"Checkpoint from epoch {epoch}")
+            else:
+                state_dict = checkpoint
+            
+            # Load weights
+            missing, unexpected = self.infinity.load_state_dict(state_dict, strict=False)
+            if missing:
+                logger.info(f"Missing keys: {len(missing)} (expected for frozen backbone)")
+            if unexpected:
+                logger.warning(f"Unexpected keys: {len(unexpected)}")
+            
+            logger.info("Trained checkpoint loaded successfully")
         
         self.dynamic_resolution_h_w = dynamic_resolution_h_w
         self.h_div_w_templates = h_div_w_templates
@@ -256,22 +279,23 @@ class InfinityPanoGenerator:
             faces_tensor = faces_tensor / 255.0
         
         if self.config.use_shared_border_latent:
-            faces_tensor = faces_tensor.unsqueeze(0).to(self.device)
-            faces_tensor = synchronize_cubemap_borders(
-                faces_tensor,
-                mode=self.config.shared_border_mode,
-                border_width=self.config.shared_border_width_tokens,
+            # Note: Cubemap border synchronization is not implemented in this version.
+            # To enable, uncomment the import at the top of this file and implement
+            # the synchronize_cubemap_borders function in pano/fastvar/shared_border.py
+            logger.warning(
+                "use_shared_border_latent is enabled but cubemap border synchronization "
+                "is not available. Skipping border sync. Set use_shared_border_latent=False "
+                "in config to suppress this warning."
             )
-            faces_tensor = faces_tensor.squeeze(0)
         
         return faces_tensor
 
 
-def save_erp_image(image: torch.Tensor, output_path: Path) -> None:
+def save_erp_image(image: Union[torch.Tensor, np.ndarray], output_path: Path) -> None:
     if isinstance(image, np.ndarray):
         img_np = image
     else:
-        img_np = image.cpu().numpy()
+        img_np = image.cpu().numpy()  # type: np.ndarray
     
     if img_np.dtype != np.uint8:
         if img_np.max() <= 1.0:

@@ -53,8 +53,8 @@ class PanoConfig:
     spherical_bias_tau_deg: Optional[float] = None  # optional temperature in degrees
     spherical_attn_fallback: str = "standard"  # "standard" or "sparse_neighbor"
     
-    # Seam losses
-    use_seam_losses: bool = True
+    # Seam losses (disabled by default when using 3D direction embeddings + spherical attention bias)
+    use_seam_losses: bool = False
     wrap_seam_weight: float = 1.0
     pole_consistency_weight: float = 1.0
     pole_band_deg: float = 20.0  # degrees from pole to apply consistency
