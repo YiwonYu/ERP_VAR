@@ -88,7 +88,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
     parser.add_argument("--target_height", type=int, default=512)
     
-    parser.add_argument("--pn", type=str, default="1M", choices=["0.06M", "0.25M", "1M"])
+    parser.add_argument("--pn", type=str, default="1M", choices=["0.06M", "0.25M", "0.60M", "1M", "2M"])
     parser.add_argument("--model_path", type=str, required=True)
     parser.add_argument("--vae_path", type=str, required=True)
     parser.add_argument("--text_encoder_ckpt", type=str, required=True)
@@ -247,16 +247,26 @@ class InfinityDDPTrainer:
             # Alternative: only train last N transformer blocks
             trainable_count = 0
             frozen_count = 0
+            total_blocks = int(getattr(self.infinity, "depth", 32))
+            blocks_per_chunk = int(getattr(self.infinity, "num_blocks_in_a_chunk", 1))
             for name, param in self.infinity.named_parameters():
                 should_train = False
                 # Always train head and embeddings
                 if any(kw in name.lower() for kw in ['head', 'lvl_embed', 'out_proj']):
                     should_train = True
                 # Train last N blocks
-                elif 'blocks.' in name:
+                elif 'blocks.' in name or 'block_chunks.' in name:
                     try:
-                        block_idx = int(name.split('blocks.')[1].split('.')[0])
-                        total_blocks = 32  # For infinity_2b
+                        if 'blocks.' in name:
+                            block_idx = int(name.split('blocks.')[1].split('.')[0])
+                        else:
+                            chunk_idx = int(name.split('block_chunks.')[1].split('.')[0])
+                            module_split = name.split('.module.')
+                            if len(module_split) > 1:
+                                in_chunk_idx = int(module_split[1].split('.')[0])
+                            else:
+                                in_chunk_idx = 0
+                            block_idx = chunk_idx * blocks_per_chunk + in_chunk_idx
                         if block_idx >= total_blocks - self.args.train_last_n_blocks:
                             should_train = True
                     except (IndexError, ValueError):

@@ -316,7 +316,7 @@ def load_transformer(vae, args):
 def add_common_arguments(parser):
     parser.add_argument('--cfg', type=str, default='3')
     parser.add_argument('--tau', type=float, default=1)
-    parser.add_argument('--pn', type=str, required=True, choices=['0.06M', '0.25M', '1M'])
+    parser.add_argument('--pn', type=str, required=True, choices=['0.06M', '0.25M', '0.60M', '1M', '2M'])
     parser.add_argument('--model_path', type=str, required=True)
     parser.add_argument('--cfg_insertion_layer', type=int, default=0)
     parser.add_argument('--vae_type', type=int, default=1)

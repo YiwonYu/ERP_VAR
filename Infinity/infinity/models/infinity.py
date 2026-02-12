@@ -391,8 +391,11 @@ class Infinity(nn.Module):
         patch_t, patch_h, patch_w = scale_schedule[scale_ind]
         t_mul_h_mul_w = patch_t * patch_h * patch_w
         assert t_mul_h_mul_w + need_to_pad == seq_len
-        feature[:, :t_mul_h_mul_w] += self.lvl_embed(scale_ind*torch.ones((bs, t_mul_h_mul_w),dtype=torch.int).to(feature.device))
-        return feature
+        lvl_embedding = self.lvl_embed(scale_ind * torch.ones((bs, t_mul_h_mul_w), dtype=torch.int, device=feature.device))
+        feature_prefix = feature[:, :t_mul_h_mul_w] + lvl_embedding
+        if t_mul_h_mul_w == seq_len:
+            return feature_prefix
+        return torch.cat((feature_prefix, feature[:, t_mul_h_mul_w:]), dim=1)
     
     def add_lvl_embeding_for_x_BLC(self, x_BLC, scale_schedule, need_to_pad=0):
         ptr = 0

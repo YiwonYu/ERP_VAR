@@ -74,7 +74,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max_grad_norm", type=float, default=1.0, help="Max gradient norm for clipping")
     
     # Infinity model arguments
-    parser.add_argument("--pn", type=str, default="1M", choices=["0.06M", "0.25M", "1M"], help="Model resolution preset")
+    parser.add_argument("--pn", type=str, default="1M", choices=["0.06M", "0.25M", "0.60M", "1M", "2M"], help="Model resolution preset")
     parser.add_argument("--model_path", type=str, required=True, help="Path to Infinity model weights")
     parser.add_argument("--vae_path", type=str, required=True, help="Path to VAE weights")
     parser.add_argument("--text_encoder_ckpt", type=str, required=True, help="Path to T5 text encoder")

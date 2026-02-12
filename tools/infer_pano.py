@@ -50,7 +50,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num_samples", type=int, default=1, help="Samples per prompt")
     parser.add_argument("--seed", type=int, default=None, help="Random seed")
     
-    parser.add_argument("--pn", type=str, default="1M", choices=["0.06M", "0.25M", "0.60M", "1M"])
+    parser.add_argument("--pn", type=str, default="1M", choices=["0.06M", "0.25M", "0.60M", "1M", "2M"])
     parser.add_argument("--model_path", type=str, required=True, help="Path to Infinity model weights")
     parser.add_argument("--checkpoint", type=str, default=None, 
                         help="Path to trained checkpoint (e.g., outputs/pano_matterport3d/checkpoint_latest.pt)")

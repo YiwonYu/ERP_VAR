@@ -1,4 +1,5 @@
 import json
+import math
 import numpy as np
 import tqdm
 
@@ -43,6 +44,33 @@ for ratio in full_ratio2hws:
             'pixel': pixel,
             'scales': scales
         }
+
+TARGET_2M_PIXELS = 2048 * 1024
+TARGET_2M_LATENT_TOKENS = TARGET_2M_PIXELS // (vae_stride * vae_stride)
+
+for ratio in dynamic_resolution_h_w:
+    base_scales = dynamic_resolution_h_w[ratio]['1M']['scales']
+    base_last_h = base_scales[-1][1]
+    base_last_w = base_scales[-1][2]
+
+    target_2m_w = max(1, int(round(math.sqrt(TARGET_2M_LATENT_TOKENS / ratio))))
+    target_2m_h = max(1, int(round(target_2m_w * ratio)))
+
+    h_scale = target_2m_h / base_last_h
+    w_scale = target_2m_w / base_last_w
+
+    scaled_scales = []
+    for t, h, w in base_scales:
+        h_scaled = max(1, int(round(h * h_scale)))
+        w_scaled = max(1, int(round(w * w_scale)))
+        scaled_scales.append((t, h_scaled, w_scaled))
+
+    t_last = scaled_scales[-1][0]
+    scaled_scales[-1] = (t_last, target_2m_h, target_2m_w)
+    dynamic_resolution_h_w[ratio]['2M'] = {
+        'pixel': (target_2m_h * vae_stride, target_2m_w * vae_stride),
+        'scales': scaled_scales,
+    }
 
 h_div_w_templates = []
 for h_div_w in dynamic_resolution_h_w.keys():
